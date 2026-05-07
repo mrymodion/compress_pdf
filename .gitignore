@@ -1,16 +1,35 @@
-*.pyc
+```
+# Build artifacts and generated files
+*.pdf
+
+# Dependencies
+node_modules/
+.venv/
+venv/
 __pycache__/
+.mypy_cache/
+.pytest_cache/
+
+# Logs and temp files
 *.log
 *.tmp
 *.swp
+
+# Environment
 .env
 .env.local
+*.env.*
+
+# Editors
 .vscode/
 .idea/
-dist/
-build/
-.coverage
-htmlcov/
+
+# Coverage reports
 coverage/
-.mypy_cache/
-.pytest_cache/
+htmlcov/
+.coverage
+
+# OS generated files
+.DS_Store
+Thumbs.db
+```

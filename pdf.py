@@ -207,9 +207,10 @@ class ContentClass(Enum):
 
 
 class CompressionMode(Enum):
-    AUTO       = "auto"
-    HYBRID     = "hybrid"
-    AGGRESSIVE = "aggressive"
+    AUTO            = "auto"
+    HYBRID          = "hybrid"
+    AGGRESSIVE      = "aggressive"
+    ULTRA_AGGRESSIVE = "ultra_aggressive"  # NEW: Mode kompresi maksimal dengan rasterisasi 72 DPI
 
 
 @dataclass
@@ -223,6 +224,7 @@ class CompressionProfile:
     - Object deduplication untuk mengurangi redundansi
     - Aggressive font subsetting untuk hapus glyphs tidak terpakai
     - Lower quality floors untuk kompresi lebih ekstrem
+    - Grayscale conversion threshold yang lebih agresif
     """
     ssim_target: float              = 0.90  # Target SSIM minimum (0.0-1.0)
     jpeg_quality_min: int           = 25    # Floor untuk kualitas JPEG -- turunkan dari 30
@@ -240,6 +242,9 @@ class CompressionProfile:
     remove_unused_fonts: bool       = True  # Hapus font yang tidak digunakan sama sekali
     compress_xml_metadata: bool     = True  # Compress XML metadata streams
     linearize_pdf: bool             = True  # Linearize PDF untuk fast web view
+    grayscale_threshold: int        = 100   # Unique colors threshold untuk grayscale conversion -- naikkan dari 60
+    object_stream_mode: bool        = True  # Enable object stream consolidation -- NEW
+    ultra_aggressive_dpi: int       = 72    # DPI untuk ULTRA_AGGRESSIVE mode -- NEW
 
 
 @dataclass
@@ -965,39 +970,39 @@ class IntelligentPDFCompressor:
                     # Ini meniru teknik ilovepdf yang menghasilkan kompresi 35-40%
                     original_w, original_h = pil_img.width, pil_img.height
                     
-                    # Threshold lebih agresif: semua gambar > 120px harus downscaled
-                    downscale_threshold = 120
-                    target_max = 90  # Target maksimal sisi terpanjang
+                    # IMPROVEMENT v3.4: Threshold lebih agresif dan quality override
+                    downscale_threshold = 80   # Turunkan dari 120 -> 80 (P0 quick win)
+                    target_max = 60            # Turunkan dari 90 -> 60 (P0 quick win)
                     
                     if original_w > downscale_threshold or original_h > downscale_threshold:
                         # Hitung scale factor untuk mencapai target_max
                         scale_factor = target_max / max(original_w, original_h)
-                        new_w = max(50, int(original_w * scale_factor))
-                        new_h = max(50, int(original_h * scale_factor))
+                        new_w = max(40, int(original_w * scale_factor))
+                        new_h = max(40, int(original_h * scale_factor))
                         
                         lanczos = _get_resampling_lanczos()
                         pil_img = pil_img.resize((new_w, new_h), lanczos)
                         
                         # FORCE downgrade quality untuk gambar yang di-downscale drastis
-                        # Simpan info untuk digunakan nanti di encoder
+                        # IMPROVEMENT v3.4: Turunkan quality override dari 45 -> 35 (P0 quick win)
                         pil_img._downscaled = True  # Marker untuk encoder
-                        pil_img._original_quality = 45  # Override quality
+                        pil_img._original_quality = 35  # Turunkan dari 45 -> 35
                         
                         log.debug(f"  [AGGRESSIVE] hal.{i+1}: {original_w}x{original_h} -> {new_w}x{new_h} "
                                  f"(scale: {scale_factor:.2f})")
                     
-                    # Skip gambar sangat kecil (< 50px) - tidak worth it
-                    if pil_img.width < 50 or pil_img.height < 50:
+                    # Skip gambar sangat kecil (< 40px) - tidak worth it
+                    if pil_img.width < 40 or pil_img.height < 40:
                         log.debug(f"  Skip hal.{i+1}: gambar terlalu kecil ({pil_img.width}x{pil_img.height})")
                         continue
 
-                    # IMPROVEMENT v3.3: Deteksi dan convert ke grayscale jika dominan grayscale
-                    # Menghemat 3x bandwidth warna (RGB -> L)
+                    # IMPROVEMENT v3.4: Grayscale conversion lebih agresif (P0 quick win)
+                    # Naikkan threshold dari 60 -> 100 unique colors
                     arr_check = np.array(pil_img.convert("L"))
                     unique_gray = len(np.unique(arr_check))
-                    if unique_gray < 60:  # Sangat sedikit variasi grayscale
+                    if unique_gray < self.profile.grayscale_threshold:  # Naik dari 60 -> 100
                         pil_img = pil_img.convert("L")
-                        log.debug(f"  Converted to grayscale: {unique_gray} unique gray levels")
+                        log.debug(f"  Converted to grayscale: {unique_gray} unique gray levels (threshold={self.profile.grayscale_threshold})")
 
                     opt_bytes, fmt, quality, ssim = optimizer.optimize(pil_img)
 
@@ -1055,9 +1060,18 @@ class IntelligentPDFCompressor:
         # terkunci di Windows dan os.remove() di finally luar akan gagal.
         try:
             # Pass 1: pikepdf — image replacement + stream compression
-            # FIX #1: hanya compress_streams=True, tanpa recompress_streams
+            # IMPROVEMENT v3.4: Enable object_stream_mode untuk kompresi struktur (P0 quick win)
+            object_stream_setting = (
+                pikepdf.ObjectStreamMode.generate 
+                if self.profile.object_stream_mode 
+                else pikepdf.ObjectStreamMode.preserve
+            )
             try:
-                pdf.save(tmp_path, compress_streams=True)
+                pdf.save(
+                    tmp_path, 
+                    compress_streams=True,
+                    object_stream_mode=object_stream_setting
+                )
             finally:
                 pdf.close()  # Pastikan pikepdf melepas handle sebelum fitz membuka
 
@@ -1115,12 +1129,73 @@ class IntelligentPDFCompressor:
             del pix, pil_image, raw_samples
             gc.collect()
 
-        save_kw = _fitz_save_kwargs(self.profile.deflate_level, use_linear=False)
+        save_kw = _fitz_save_kwargs(self.profile.deflate_level, use_linear=self.profile.linearize_pdf)
         new_doc.save(self.output_path, **save_kw)
         new_doc.close()
         doc.close()
 
         self.report.images_optimized = images_optimized
+
+    # -- Stage 3c: Ultra Aggressive --------------------------------------------
+
+    def _compress_ultra_aggressive(self, optimizer: AdaptiveImageOptimizer) -> None:
+        """
+        ULTRA AGGRESSIVE: Rasterisasi seluruh halaman @ 72 DPI (screen resolution).
+        
+        IMPROVEMENT v3.4 (P1 - Short-term):
+        - Mode kompresi maksimal dengan rasterisasi 72 DPI
+        - Menghasilkan ukuran file terkecil, mendekati ilovepdf
+        - Trade-off: teks tidak searchable, kualitas visual berkurang
+        
+        Teknik ini meniru pendekatan ilovepdf yang re-rasterize @ 60-80 DPI.
+        Cocok untuk dokumen archive yang hanya perlu ditampilkan di screen.
+        """
+        dpi = self.profile.ultra_aggressive_dpi  # Default 72 DPI
+        log.info(f"Stage 3: Mode ULTRA_AGGRESSIVE -- Rasterisasi pada {dpi} DPI (MAX COMPRESSION)...")
+        log.warning("  [!!!] MODE EKSTREM - PDF output TIDAK searchable dan kualitas rendah")
+        log.warning("  [!!!] Gunakan HANYA untuk archive/display di screen")
+
+        doc     = fitz.open(self.input_path)
+        new_doc = fitz.open()
+        mat     = fitz.Matrix(dpi / 72, dpi / 72)
+
+        images_optimized = 0
+        total_pages = len(doc)
+        
+        for page_num in range(total_pages):
+            page = doc[page_num]
+            if page_num % 5 == 0 or page_num == total_pages - 1:
+                log.info(f"  Processing halaman {page_num+1}/{total_pages}...")
+
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            raw_samples = bytes(pix.samples)
+            pil_image   = Image.frombytes("RGB", (pix.width, pix.height), raw_samples)
+
+            # Force ultra-low quality untuk mode ini
+            pil_image._downscaled = True
+            pil_image._original_quality = 25  # Quality minimal untuk kompresi ekstrem
+            
+            opt_bytes, fmt, quality, ssim = optimizer.optimize(pil_image)
+            log.debug(f"  Hal. {page_num+1} [{fmt}] q={quality} ssim={ssim:.4f}")
+
+            new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+            new_page.insert_image(new_page.rect, stream=opt_bytes)
+            images_optimized += 1
+
+            del pix, pil_image, raw_samples
+            gc.collect()
+
+        # Save dengan semua optimasi struktural
+        save_kw = _fitz_save_kwargs(
+            self.profile.deflate_level, 
+            use_linear=self.profile.linearize_pdf
+        )
+        new_doc.save(self.output_path, **save_kw)
+        new_doc.close()
+        doc.close()
+
+        self.report.images_optimized = images_optimized
+        self.report.mode_applied = f"ULTRA_AGGRESSIVE@{dpi}DPI"
 
     # -- Stage 4: Font Optimization --------------------------------------------
 
@@ -1610,7 +1685,11 @@ class IntelligentPDFCompressor:
         elif self.mode == CompressionMode.HYBRID:
             self._compress_hybrid(optimizer)
             self.report.mode_applied = "HYBRID"
-        else:
+        elif self.mode == CompressionMode.ULTRA_AGGRESSIVE:
+            # IMPROVEMENT v3.4: Mode kompresi maksimal
+            self._compress_ultra_aggressive(optimizer)
+            # mode_applied sudah di-set di dalam _compress_ultra_aggressive
+        else:  # AGGRESSIVE
             self._compress_aggressive(optimizer)
             self.report.mode_applied = "AGGRESSIVE"
 
@@ -1653,8 +1732,8 @@ Contoh penggunaan:
     parser.add_argument("input",  type=str, help="Path file PDF input")
     parser.add_argument("output", type=str, help="Path file PDF output")
     parser.add_argument(
-        "--mode", choices=["auto", "hybrid", "aggressive"], default="auto",
-        help="Mode kompresi (default: auto)"
+        "--mode", choices=["auto", "hybrid", "aggressive", "ultra_aggressive"], default="auto",
+        help="Mode kompresi (default: auto). ultra_aggressive = kompresi maksimal @ 72 DPI"
     )
     parser.add_argument(
         "--ssim", type=float, default=0.92,
@@ -1694,9 +1773,10 @@ def main():
         sys.exit(1)
 
     mode_map = {
-        "auto":       CompressionMode.AUTO,
-        "hybrid":     CompressionMode.HYBRID,
-        "aggressive": CompressionMode.AGGRESSIVE,
+        "auto":             CompressionMode.AUTO,
+        "hybrid":           CompressionMode.HYBRID,
+        "aggressive":       CompressionMode.AGGRESSIVE,
+        "ultra_aggressive": CompressionMode.ULTRA_AGGRESSIVE,
     }
     profile = CompressionProfile(
         ssim_target=args.ssim,
@@ -1744,7 +1824,7 @@ def compress_pdf(
     Args:
         input_path:             Path file PDF input
         output_path:            Path file PDF output
-        mode:                   "auto" | "hybrid" | "aggressive"
+        mode:                   "auto" | "hybrid" | "aggressive" | "ultra_aggressive"
         ssim_target:            Threshold SSIM minimum (0.0-1.0)
         max_resolution:         Max dimensi gambar dalam piksel
         apply_font_subsetting:  Aktifkan optimasi font
@@ -1761,12 +1841,13 @@ def compress_pdf(
         log.setLevel(logging.DEBUG)
 
     mode_map = {
-        "auto":       CompressionMode.AUTO,
-        "hybrid":     CompressionMode.HYBRID,
-        "aggressive": CompressionMode.AGGRESSIVE,
+        "auto":             CompressionMode.AUTO,
+        "hybrid":           CompressionMode.HYBRID,
+        "aggressive":       CompressionMode.AGGRESSIVE,
+        "ultra_aggressive": CompressionMode.ULTRA_AGGRESSIVE,
     }
     if mode not in mode_map:
-        raise ValueError(f"Mode tidak valid: '{mode}'. Gunakan: auto, hybrid, aggressive")
+        raise ValueError(f"Mode tidak valid: '{mode}'. Gunakan: auto, hybrid, aggressive, ultra_aggressive")
 
     profile = CompressionProfile(
         ssim_target=ssim_target,
