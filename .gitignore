@@ -1,0 +1,33 @@
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PDF files (likely generated/test artifacts)
+*.pdf
+
+# Dependencies
+.venv/
+venv/
+env/
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Build artifacts
+dist/
+build/
+*.out
+```

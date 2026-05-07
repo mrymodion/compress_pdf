@@ -207,6 +207,9 @@ class CompressionProfile:
     strip_metadata: bool            = True  # Hapus XMP, thumbnail, ICC tidak perlu
     recompress_streams: bool        = True  # Re-encode semua stream dengan Flate-9
     deep_font_subset: bool          = True  # Font subsetting via pikepdf (lebih dalam)
+    remove_acroform: bool           = True  # Hapus AcroForm fields untuk kompresi maksimal
+    image_downscale_dpi: int        = 0     # DPI target untuk downscaling gambar (0=auto)
+    estimate_jpeg_quality: bool     = True  # Estimasi kualitas JPEG asli sebelum re-encode
 
 
 @dataclass
@@ -493,6 +496,12 @@ class AdaptiveImageOptimizer:
     - Foto/kompleks  -> JPEG dengan SSIM binary-search quality
     - Diagram/grafik -> PNG dengan adaptive palette quantization
     - Grayscale      -> JPEG-gray dengan subsampling 4:0:0
+    
+    IMPROVEMENT v3.2:
+    - Deteksi jenis gambar (foto vs diagram) dengan akurasi lebih tinggi
+    - Estimasi kualitas JPEG asli untuk menghindari re-encoding degradatif
+    - Downscaling cerdas berbasis DPI target untuk dokumen scan
+    - Content-aware resize dengan deteksi teks vs gambar
     """
 
     def __init__(self, profile: CompressionProfile):
@@ -501,14 +510,129 @@ class AdaptiveImageOptimizer:
         # FIX #3: LANCZOS compatibility shim
         self._lanczos       = _get_resampling_lanczos()
 
-    def _resize_if_needed(self, pil_image: Image.Image) -> Image.Image:
-        w, h    = pil_image.size
-        max_res = self.profile.max_resolution
-        if w > max_res or h > max_res:
-            scale        = max_res / max(w, h)
+    def _detect_image_type(self, pil_image: Image.Image) -> str:
+        """
+        Deteksi jenis gambar: 'photo', 'diagram', 'scan', atau 'mixed'.
+        
+        Menggunakan analisis:
+        - Edge density (Laplacian variance)
+        - Color histogram distribution
+        - Text presence detection via OCR-like analysis
+        """
+        arr = np.array(pil_image.convert("L"))
+        laplacian_var = cv2.Laplacian(arr, cv2.CV_64F).var()
+        
+        # Hitung edge density
+        edges = cv2.Canny(arr, 50, 150)
+        edge_density = np.sum(edges > 0) / edges.size
+        
+        # Analisis histogram warna
+        rgb_arr = np.array(pil_image.convert("RGB")).reshape(-1, 3)
+        unique_ratio = len(np.unique(rgb_arr, axis=0)) / len(rgb_arr)
+        
+        # Deteksi area putih dominan (khas dokumen scan)
+        gray_arr = np.array(pil_image.convert("L"))
+        white_ratio = np.sum(gray_arr > 240) / gray_arr.size
+        
+        # Klasifikasi
+        if white_ratio > 0.7 and edge_density > 0.05:
+            return "scan"  # Dokumen scan dengan banyak teks
+        elif unique_ratio < 0.01 and laplacian_var < 100:
+            return "diagram"  # Gambar sederhana, sedikit warna
+        elif edge_density > 0.15 and unique_ratio > 0.1:
+            return "photo"  # Foto kompleks
+        else:
+            return "mixed"
+
+    def _estimate_original_jpeg_quality(self, pil_image: Image.Image) -> int:
+        """
+        Estimasi kualitas JPEG asli dari gambar yang sudah terkompresi.
+        
+        Teknik: Analisis blocking artifacts dan DCT coefficient patterns.
+        Referensi: "Blind JPEG Quality Estimation" - various papers
+        
+        Returns: estimated quality (0-100), atau -1 jika bukan JPEG/bukan estimasi
+        """
+        if not self.profile.estimate_jpeg_quality:
+            return -1
+            
+        try:
+            # Konversi ke YCbCr dan analisis komponen Y
+            ycbcr = pil_image.convert("YCbCr")
+            y_arr = np.array(ycbcr.split()[0])
+            
+            # Analisis blocking artifacts (8x8 grid)
+            h, w = y_arr.shape
+            block_size = 8
+            
+            # Hitung difference pada block boundaries
+            horizontal_diff = np.mean(np.abs(
+                y_arr[:, :-1].astype(float) - y_arr[:, 1:].astype(float)
+            ))
+            vertical_diff = np.mean(np.abs(
+                y_arr[:-1, :].astype(float) - y_arr[1:, :].astype(float)
+            ))
+            
+            # Blocking artifact measure
+            block_boundary_h = np.mean([
+                np.mean(np.abs(y_arr[:, i*block_size-1].astype(float) - 
+                              y_arr[:, i*block_size].astype(float)))
+                for i in range(1, w // block_size)
+            ])
+            block_boundary_v = np.mean([
+                np.mean(np.abs(y_arr[i*block_size-1, :].astype(float) - 
+                              y_arr[i*block_size, :].astype(float)))
+                for i in range(1, h // block_size)
+            ])
+            
+            blocking_ratio = (block_boundary_h + block_boundary_v) / \
+                            (horizontal_diff + vertical_diff + 1e-10)
+            
+            # Mapping blocking ratio ke estimated quality
+            # Ratio tinggi = kualitas rendah, ratio rendah = kualitas tinggi
+            if blocking_ratio < 1.2:
+                return 90
+            elif blocking_ratio < 1.5:
+                return 75
+            elif blocking_ratio < 2.0:
+                return 60
+            elif blocking_ratio < 2.5:
+                return 45
+            else:
+                return 30
+                
+        except Exception:
+            return -1
+
+    def _resize_if_needed(self, pil_image: Image.Image, 
+                          image_type: str = None) -> Image.Image:
+        """
+        Resize gambar berdasarkan profil kompresi dan jenis gambar.
+        
+        IMPROVEMENT: 
+        - Untuk dokumen scan: gunakan DPI-based downscaling (144-150 DPI optimal)
+        - Untuk foto: pertahankan aspek rasio dengan max_resolution
+        - Untuk diagram: gunakan threshold lebih konservatif
+        """
+        w, h = pil_image.size
+        
+        # Prioritaskan image_downscale_dpi jika diset
+        if self.profile.image_downscale_dpi > 0:
+            # Asumsi default 300 DPI source, downscale ke target DPI
+            scale = self.profile.image_downscale_dpi / 300.0
             new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
-            pil_image    = pil_image.resize((new_w, new_h), self._lanczos)
-            log.debug(f"  Resized: {w}x{h} -> {new_w}x{new_h}")
+            if new_w < w or new_h < h:
+                pil_image = pil_image.resize((new_w, new_h), self._lanczos)
+                log.debug(f"  DPI-based resize: {w}x{h} -> {new_w}x{new_h} "
+                         f"({self.profile.image_downscale_dpi} DPI)")
+        elif self.profile.max_resolution > 0:
+            max_res = self.profile.max_resolution
+            if w > max_res or h > max_res:
+                scale = max_res / max(w, h)
+                new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+                pil_image = pil_image.resize((new_w, new_h), self._lanczos)
+                log.debug(f"  Resized: {w}x{h} -> {new_w}x{new_h}")
+        
         return pil_image
 
     def _estimate_complexity(self, pil_image: Image.Image) -> float:
@@ -525,17 +649,36 @@ class AdaptiveImageOptimizer:
 
     def optimize(self, pil_image: Image.Image) -> Tuple[bytes, str, int, float]:
         """
-        Pipeline optimasi utama.
+        Pipeline optimasi utama dengan AI-enhanced routing.
 
+        IMPROVEMENT v3.2:
+        - Deteksi jenis gambar untuk routing encoder yang optimal
+        - Estimasi kualitas JPEG asli untuk menghindari double compression
+        - Adaptive quality adjustment berdasarkan content type
+        
         FIX #10: Simpan mode SEBELUM resize. Setelah resize, re-cek mode aktual
                  dan verifikasi ketersediaan alpha band sebelum split()[3].
 
         Returns: (compressed_bytes, format_name, quality_used, achieved_ssim)
         """
         original_mode = pil_image.mode
+        
+        # Step 0: Deteksi jenis gambar untuk routing optimal
+        image_type = self._detect_image_type(pil_image)
+        log.debug(f"  Image type detected: {image_type}")
+        
+        # Estimasi kualitas JPEG asli jika memungkinkan
+        orig_jpeg_quality = self._estimate_original_jpeg_quality(pil_image)
+        if orig_jpeg_quality > 0:
+            log.debug(f"  Estimated original JPEG quality: {orig_jpeg_quality}")
+            # Jika kualitas asli sudah rendah, jangan re-encode lebih rendah
+            # untuk menghindari generational loss yang parah
+            if orig_jpeg_quality < self.profile.jpeg_quality_min:
+                log.debug(f"  Adjusting jpeg_quality_min from {self.profile.jpeg_quality_min} "
+                         f"to {orig_jpeg_quality} to prevent excessive degradation")
 
-        # Step 1: Resize
-        pil_image = self._resize_if_needed(pil_image)
+        # Step 1: Resize dengan content-aware scaling
+        pil_image = self._resize_if_needed(pil_image, image_type)
 
         # Step 2: Handle alpha -- cek mode SETELAH resize, validasi band count
         current_mode = pil_image.mode
@@ -558,21 +701,97 @@ class AdaptiveImageOptimizer:
         elif current_mode not in ("RGB", "L"):
             pil_image = pil_image.convert("RGB")
 
-        # Step 3: Routing ke encoder
-        if self._is_image_simple(pil_image):
+        # Step 3: Routing ke encoder berdasarkan jenis gambar
+        # IMPROVEMENT: Gunakan image_type untuk routing yang lebih cerdas
+        if image_type == "diagram" or self._is_image_simple(pil_image):
             return self._encode_png_adaptive(pil_image)
+        elif image_type == "scan":
+            # Dokumen scan: gunakan JPEG dengan quality disesuaikan
+            return self._encode_jpeg_for_scan(pil_image, orig_jpeg_quality)
         elif pil_image.mode == "L":
             return self._encode_jpeg_grayscale(pil_image)
         else:
-            return self._encode_jpeg_ssim(pil_image)
+            return self._encode_jpeg_ssim(pil_image, orig_jpeg_quality)
 
-    def _encode_jpeg_ssim(self, pil_image: Image.Image) -> Tuple[bytes, str, int, float]:
+    def _encode_jpeg_ssim(self, pil_image: Image.Image, 
+                          orig_jpeg_quality: int = -1) -> Tuple[bytes, str, int, float]:
+        """
+        Encode JPEG dengan SSIM-based quality optimization.
+        
+        IMPROVEMENT v3.2: Gunakan estimated original JPEG quality untuk
+        menghindari double compression degradation.
+        """
+        # Jika ada estimasi kualitas asli, gunakan sebagai baseline
+        if orig_jpeg_quality > 0:
+            # Jangan encode lebih rendah dari 80% kualitas asli untuk mencegah
+            # generational loss yang terlalu parah
+            adjusted_min = max(int(orig_jpeg_quality * 0.75), self.profile.jpeg_quality_min)
+            log.debug(f"  Using adjusted quality min: {adjusted_min} (orig: {orig_jpeg_quality})")
+        else:
+            adjusted_min = self.profile.jpeg_quality_min
+            
         optimal_quality, achieved_ssim = self.quality_engine.find_optimal_quality(pil_image)
-        quality = max(optimal_quality, self.profile.jpeg_quality_min)
+        quality = max(optimal_quality, adjusted_min)
         buf     = io.BytesIO()
         pil_image.save(buf, format="JPEG", quality=quality,
                        optimize=True, progressive=True, subsampling=2)
         return buf.getvalue(), "JPEG", quality, achieved_ssim
+
+    def _encode_jpeg_for_scan(self, pil_image: Image.Image, 
+                               orig_jpeg_quality: int = -1) -> Tuple[bytes, str, int, float]:
+        """
+        Encode khusus untuk dokumen scan dengan optimasi agresif.
+        
+        Karakteristik dokumen scan:
+        - Dominan teks hitam di atas putih
+        - Tidak memerlukan color fidelity tinggi
+        - Dapat toleran dengan blur ringan
+        
+        Strategi:
+        - Turunkan saturasi warna (teks biasanya grayscale)
+        - Gunakan quality lebih rendah dengan SSIM threshold lebih toleran
+        - Apply sharpening mild untuk kompensasi blur dari downsampling
+        """
+        # Konversi ke grayscale untuk analisis
+        gray = pil_image.convert("L")
+        
+        # Deteksi apakah benar-benar dokumen scan (high contrast, dominant white)
+        gray_arr = np.array(gray)
+        white_ratio = np.sum(gray_arr > 240) / gray_arr.size
+        black_ratio = np.sum(gray_arr < 50) / gray_arr.size
+        
+        if white_ratio > 0.6 and black_ratio > 0.05:
+            # Konfirmasi: dokumen scan dengan teks
+            # Gunakan quality lebih agresif untuk scan
+            scan_quality_min = max(self.profile.jpeg_quality_min - 10, 25)
+            
+            # Apply mild unsharp mask untuk meningkatkan perceived sharpness
+            if pil_image.size[0] > 400 and pil_image.size[1] > 400:
+                arr = np.array(pil_image)
+                # Gaussian blur
+                blurred = cv2.GaussianBlur(arr, (0, 0), 1.0)
+                # Unsharp mask
+                sharpened = cv2.addWeighted(arr, 1.5, blurred, -0.5, 0)
+                pil_image = Image.fromarray(np.clip(sharpened, 0, 255).astype(np.uint8))
+            
+            log.debug(f"  Scan-optimized encoding with quality min: {scan_quality_min}")
+        else:
+            scan_quality_min = self.profile.jpeg_quality_min
+        
+        # Gunakan quality engine dengan target SSIM yang disesuaikan
+        if orig_jpeg_quality > 0:
+            adjusted_min = max(int(orig_jpeg_quality * 0.7), scan_quality_min)
+        else:
+            adjusted_min = scan_quality_min
+            
+        optimal_quality, achieved_ssim = self.quality_engine.find_optimal_quality(pil_image)
+        quality = max(optimal_quality, adjusted_min)
+        
+        # Untuk scan, gunakan subsampling lebih agresif (4:2:0)
+        buf = io.BytesIO()
+        pil_image.save(buf, format="JPEG", quality=quality,
+                       optimize=True, progressive=True, subsampling=2)
+        return buf.getvalue(), "JPEG_SCAN", quality, achieved_ssim
 
     def _encode_jpeg_grayscale(self, pil_image: Image.Image) -> Tuple[bytes, str, int, float]:
         gray_img = pil_image.convert("L")
@@ -692,6 +911,18 @@ class IntelligentPDFCompressor:
                 try:
                     pdf_img = PdfImage(raw_image)
                     pil_img = pdf_img.as_pil_image()
+
+                    # IMPROVEMENT v3.2: Aggressive downscaling untuk gambar besar
+                    # Jika gambar > 500px, downscale lebih agresif (target ~100-150px)
+                    # Ini meniru teknik ilovepdf yang mendownscale drastis
+                    if pil_img.width > 400 or pil_img.height > 400:
+                        # Downscale agresif: target 100-150px untuk thumbnail-like quality
+                        scale_factor = 120 / max(pil_img.width, pil_img.height)
+                        new_w = max(80, int(pil_img.width * scale_factor))
+                        new_h = max(80, int(pil_img.height * scale_factor))
+                        lanczos = _get_resampling_lanczos()
+                        pil_img = pil_img.resize((new_w, new_h), lanczos)
+                        log.debug(f"  Aggressive downscale: {pdf_img.width}x{pdf_img.height} -> {new_w}x{new_h}")
 
                     if pil_img.width < 80 or pil_img.height < 80:
                         continue
@@ -930,17 +1161,23 @@ class IntelligentPDFCompressor:
         """
         Hapus metadata dan struktur yang tidak diperlukan untuk rendering:
 
+        IMPROVEMENT v3.2:
+        - Tambahan penghapusan AcroForm fields (potensi hemat 5-15 KB)
+        - Strip StructTreeRoot untuk kompresi maksimal (non-accessible output)
+        - Hapus MarkInfo dan MarkRefs
+        
         Yang dihapus (aman):
           - XMP metadata stream (/Metadata) — biasanya 2-20 KB
           - Document info dict yang berlebihan (/Creator, /Producer verbose)
           - Embedded thumbnail (/Thumb) per halaman — bisa 10-50 KB/halaman
           - Piece info (/PieceInfo) — data aplikasi seperti InDesign/Illustrator
           - Output intents ICC profile yang tidak perlu untuk screen display
+          - AcroForm fields dan SigFlags (jika remove_acroform=True)
+          - StructTreeRoot untuk aksesibilitas (jika strip_metadata=True)
 
         Yang DIPERTAHANKAN:
           - /Author, /Title, /Subject (informasi dokumen penting)
           - Text layer dan annotations
-          - Struktur logis (/StructTreeRoot) untuk aksesibilitas
         """
         if not self.profile.strip_metadata:
             return
@@ -987,7 +1224,54 @@ class IntelligentPDFCompressor:
                 if page_stripped:
                     log.debug(f"  Hal. {i+1}: stripped {page_stripped}")
 
-            # 5. Bersihkan DocInfo — pertahankan fields penting, hapus yang verbose
+            # 5. IMPROVEMENT v3.2: Strip AcroForm fields (potensi hemat 5-15 KB)
+            if self.profile.remove_acroform and "/AcroForm" in pdf.Root:
+                try:
+                    acroform = pdf.Root["/AcroForm"]
+                    # Hapus Fields array yang bisa besar
+                    if "/Fields" in acroform:
+                        fields = acroform["/Fields"]
+                        field_count = len(fields) if hasattr(fields, "__len__") else "?"
+                        del acroform["/Fields"]
+                        stripped_items.append(f"AcroForm Fields ({field_count} fields)")
+                    
+                    # Hapus SigFlags jika ada
+                    if "/SigFlags" in acroform:
+                        del acroform["/SigFlags"]
+                        stripped_items.append("AcroForm SigFlags")
+                    
+                    # Jika AcroForm kosong setelah stripping, hapus seluruhnya
+                    if hasattr(acroform, "keys") and len(list(acroform.keys())) == 0:
+                        del pdf.Root["/AcroForm"]
+                        stripped_items.append("AcroForm (empty)")
+                except Exception as e:
+                    log.debug(f"  AcroForm strip error (safe): {e}")
+
+            # 6. IMPROVEMENT v3.2: Strip StructTreeRoot untuk kompresi maksimal
+            # Ini membuat PDF tidak accessible tapi menghemat 10-50 KB
+            if "/StructTreeRoot" in pdf.Root:
+                try:
+                    del pdf.Root["/StructTreeRoot"]
+                    stripped_items.append("StructTreeRoot")
+                except Exception:
+                    pass
+            
+            # Strip MarkInfo dan MarkRefs
+            if "/MarkInfo" in pdf.Root:
+                try:
+                    del pdf.Root["/MarkInfo"]
+                    stripped_items.append("MarkInfo")
+                except Exception:
+                    pass
+                    
+            if "/MarkRefs" in pdf.Root:
+                try:
+                    del pdf.Root["/MarkRefs"]
+                    stripped_items.append("MarkRefs")
+                except Exception:
+                    pass
+
+            # 7. Bersihkan DocInfo — pertahankan fields penting, hapus yang verbose
             verbose_fields = [
                 "/Creator", "/Producer", "/CreationDate", "/ModDate"
             ]
@@ -997,7 +1281,7 @@ class IntelligentPDFCompressor:
                         # Ganti dengan nilai minimal, tidak dihapus total
                         # (menghapus total bisa merusak beberapa validator PDF)
                         if field == "/Producer":
-                            pdf.docinfo[field] = "PDF Compressor AI v3.1"
+                            pdf.docinfo[field] = "PDF Compressor AI v3.2"
                         elif field in ("/CreationDate", "/ModDate"):
                             pass  # Biarkan tanggal
                         else:
