@@ -1,1 +1,16 @@
-Nothing should be ignored based on the provided file changes. The only modified file is 'pdf.py', which is a source code file and should not be added to .gitignore.
+*.pyc
+__pycache__/
+*.log
+*.tmp
+*.swp
+.env
+.env.local
+.vscode/
+.idea/
+dist/
+build/
+.coverage
+htmlcov/
+coverage/
+.mypy_cache/
+.pytest_cache/
