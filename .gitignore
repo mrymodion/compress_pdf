@@ -1,1 +1,8 @@
-Nothing should be ignored based on the provided file changes. The modification of 'pdf.py' is a source code file that should not be added to .gitignore.
+```
+# Compiled Python files
+*.pyc
+__pycache__/
+
+# PDF test files
+*.pdf
+```

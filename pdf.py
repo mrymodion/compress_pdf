@@ -976,8 +976,8 @@ class IntelligentPDFCompressor:
                     original_w, original_h = pil_img.width, pil_img.height
                     
                     # Threshold lebih konservatif: hanya gambar > 250px yang downscaled
-                    downscale_threshold = 250  # NAİK dari 120px (berdasarkan SSIM study)
-                    target_min = 180  # NAİK dari 90px - batas bawah perceptual quality
+                    downscale_threshold = 250  # NAIK dari 120px (berdasarkan SSIM study)
+                    target_min = 180  # NAIK dari 90px - batas bawah perceptual quality
                     
                     if original_w > downscale_threshold or original_h > downscale_threshold:
                         # Hitung scale factor dengan preservasi aspect ratio
@@ -1004,7 +1004,7 @@ class IntelligentPDFCompressor:
                         
                         # Marker untuk encoder - quality adjustment lebih konservatif
                         pil_img._downscaled = True
-                        pil_img._original_quality = 65  # NAİK dari 45 untuk preservasi kualitas
+                        pil_img._original_quality = 65  # NAIK dari 45 untuk preservasi kualitas
                         
                         log.debug(f"  [BALANCED] hal.{i+1}: {original_w}x{original_h} -> {new_w}x{new_h} "
                                  f"(scale: {scale_factor:.2f})")
