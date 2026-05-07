@@ -242,7 +242,7 @@ class CompressionProfile:
     remove_unused_fonts: bool       = True  # Hapus font yang tidak digunakan sama sekali
     compress_xml_metadata: bool     = True  # Compress XML metadata streams
     linearize_pdf: bool             = True  # Linearize PDF untuk fast web view
-    grayscale_threshold: int        = 100   # Unique colors threshold untuk grayscale conversion -- naikkan dari 60
+    grayscale_threshold: int        = 120   # Unique colors threshold untuk grayscale conversion -- naikkan dari 60 -> 120
     object_stream_mode: bool        = True  # Enable object stream consolidation -- NEW
     ultra_aggressive_dpi: int       = 72    # DPI untuk ULTRA_AGGRESSIVE mode -- NEW
 
@@ -970,23 +970,24 @@ class IntelligentPDFCompressor:
                     # Ini meniru teknik ilovepdf yang menghasilkan kompresi 35-40%
                     original_w, original_h = pil_img.width, pil_img.height
                     
-                    # IMPROVEMENT v3.4: Threshold lebih agresif dan quality override
-                    downscale_threshold = 80   # Turunkan dari 120 -> 80 (P0 quick win)
-                    target_max = 60            # Turunkan dari 90 -> 60 (P0 quick win)
+                    # IMPROVEMENT v3.5: Balanced downscaling untuk kompresi optimal
+                    # Target: mencapai 35-40% compression seperti ilovepdf DENGAN preservasi kualitas
+                    downscale_threshold = 150  # Naikkan dari 80 -> 150 untuk kualitas lebih baik
+                    target_max = 100           # Naikkan dari 60 -> 100 untuk detail preservation
                     
                     if original_w > downscale_threshold or original_h > downscale_threshold:
                         # Hitung scale factor untuk mencapai target_max
                         scale_factor = target_max / max(original_w, original_h)
-                        new_w = max(40, int(original_w * scale_factor))
-                        new_h = max(40, int(original_h * scale_factor))
+                        new_w = max(60, int(original_w * scale_factor))
+                        new_h = max(60, int(original_h * scale_factor))
                         
                         lanczos = _get_resampling_lanczos()
                         pil_img = pil_img.resize((new_w, new_h), lanczos)
                         
                         # FORCE downgrade quality untuk gambar yang di-downscale drastis
-                        # IMPROVEMENT v3.4: Turunkan quality override dari 45 -> 35 (P0 quick win)
+                        # IMPROVEMENT v3.5: Naikkan quality override dari 35 -> 50 untuk kualitas visual
                         pil_img._downscaled = True  # Marker untuk encoder
-                        pil_img._original_quality = 35  # Turunkan dari 45 -> 35
+                        pil_img._original_quality = 50  # Naikkan dari 35 -> 50
                         
                         log.debug(f"  [AGGRESSIVE] hal.{i+1}: {original_w}x{original_h} -> {new_w}x{new_h} "
                                  f"(scale: {scale_factor:.2f})")
@@ -996,11 +997,11 @@ class IntelligentPDFCompressor:
                         log.debug(f"  Skip hal.{i+1}: gambar terlalu kecil ({pil_img.width}x{pil_img.height})")
                         continue
 
-                    # IMPROVEMENT v3.4: Grayscale conversion lebih agresif (P0 quick win)
-                    # Naikkan threshold dari 60 -> 100 unique colors
+                    # IMPROVEMENT v3.5: Grayscale conversion lebih agresif (P0 quick win)
+                    # Naikkan threshold dari 60 -> 120 unique colors untuk konversi lebih banyak
                     arr_check = np.array(pil_img.convert("L"))
                     unique_gray = len(np.unique(arr_check))
-                    if unique_gray < self.profile.grayscale_threshold:  # Naik dari 60 -> 100
+                    if unique_gray < self.profile.grayscale_threshold:  # Naik dari 60 -> 120
                         pil_img = pil_img.convert("L")
                         log.debug(f"  Converted to grayscale: {unique_gray} unique gray levels (threshold={self.profile.grayscale_threshold})")
 
