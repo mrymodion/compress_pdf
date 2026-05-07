@@ -1,16 +1,1 @@
-*.pyc
-__pycache__/
-*.log
-*.tmp
-*.swp
-.env
-.env.local
-.vscode/
-.idea/
-dist/
-build/
-.coverage
-htmlcov/
-coverage/
-.mypy_cache/
-.pytest_cache/
+Nothing needs to be added to .gitignore since only a Python source file (pdf.py) was modified and there are no build artifacts, dependencies, or temporary files in the changes.
